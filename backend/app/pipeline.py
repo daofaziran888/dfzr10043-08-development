@@ -11,10 +11,12 @@
 链路8  资源额度耗尽 → 机器人节点降级 → 任务队列回收
 链路9  OCR识别区域 → 采集批次归集 → 抽检样本 → 交接包驳回
 链路10 运行指标汇总 → 执行实例逐条核对 → 审计轨迹
+链路11 抽检样本复核 → 重新采集有效行 → 样本更正明细 → 交接包恢复
 
 额外能力：水位推进（data_landing watermark）、冲突版本仲裁（version_release rollback =
 旧版本胜出）、失败恢复（retry_policy 重试→放弃→审计）、去重（capture_batch 按采集窗
-口与上游来源判重，重复批次不落库）、迟到数据（schedule_plan 生效止日已过则拒绝投递）。
+口与上游来源判重，重复批次不落库）、迟到数据（schedule_plan 生效止日已过则拒绝投递）、
+复核更正（sample_check 按字段复核，交接恢复幂等交付，旧退回回执不撤销已恢复字段）。
 """
 from __future__ import annotations
 
@@ -606,4 +608,40 @@ def summarize_metrics(metric_id: int) -> dict[str, Any]:
         "success_rate_actual": round(actual_success_rate, 4),
         "mismatch": mismatch,
         "audit_id": audit_result["id"],
+    }
+
+
+# ── 链路11: 抽检样本复核 → 重新采集有效行 → 样本更正明细 → 交接包恢复 ─
+
+def sample_review_handoff_recovery(sample_id: int, pack_id: int,
+                                   review_results: dict[str, bool],
+                                   evidence: str = "重新采集影像") -> dict[str, Any]:
+    """对已驳回样本按字段提交复核结论，重新采集有效行并恢复交接。
+
+    复核通过的字段生成样本更正明细；交接包准备恢复单后执行恢复，
+    把已恢复来源行关联回采集样本；同一更正重复交付只生效一次，
+    未更正字段保持不可用。
+    """
+    sample_svc = service_for("sample_check")
+    handoff_svc = service_for("handoff_pack")
+
+    reviews = {}
+    for field, passed in review_results.items():
+        reviews[field] = sample_svc.submit_field_review(
+            sample_id, field, evidence, passed)
+
+    sheet_result = handoff_svc.prepare_recovery_sheet(pack_id)
+    recovery = handoff_svc.apply_recovery(pack_id)
+
+    sample = _find_entry("sample_check", sample_id)
+    return {
+        "status": "recovered" if recovery.get("ok") else recovery.get("status", "interrupted"),
+        "sample_id": sample_id,
+        "pack_id": pack_id,
+        "reviews": reviews,
+        "corrections": sample_svc.correction_details(sample_id),
+        "pending_fields": sample_svc.pending_review_fields(sample_id),
+        "sheet": sheet_result.get("sheet"),
+        "recovery": recovery,
+        "sample_status": sample.get("status"),
     }
